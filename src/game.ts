@@ -256,9 +256,10 @@ export class RhythmGame {
   finish(animationTime = 0, isVisible?: PieceVisibility) {
     if (this.phase !== "playing" && this.phase !== "paused") return this.phase;
     // endedイベントがdrawより先に届いた場合も、最後のhit/shiftを取りこぼさない。
-    if (this.phase === "playing")
-      this.advance(Infinity, animationTime, isVisible);
-    if (this.phase === "gameover") return this.phase;
+    if (this.phase === "playing") {
+      const events = this.advance(Infinity, animationTime, isVisible);
+      if (events.some((event) => event.type === "gameover")) return this.phase;
+    }
     this.phase = this.countVisiblePieces(isVisible) > 0 ? "clear" : "gameover";
     return this.phase;
   }

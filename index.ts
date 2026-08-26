@@ -241,7 +241,7 @@ async function beginPlayback(useMicrophone = true) {
 
   try {
     await playback;
-    if (game.phase === "playing")
+    if (track.playing)
       announce("ゲーム開始。曲に合わせて手拍子してください");
   } catch (error) {
     if (game.phase === "paused") return;
