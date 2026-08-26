@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "bun --hot index.html",
     "build": "bun build index.html --outdir=dist --minify",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -15,6 +16,7 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "p5": "^2.3.2"
+    "p5": "^2.3.2",
+    "web-audio-beat-detector": "^8.2.38"
   }
 }

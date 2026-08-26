@@ -1,3 +1,5 @@
+import { guess } from "web-audio-beat-detector";
+
 export type AnalysisBeat = {
   time: number;
   strength: number;
@@ -7,7 +9,10 @@ export type TrackAnalysis = {
   beats: AnalysisBeat[];
   duration: number;
   tempo: number;
+  strategy: "tempo-grid" | "onset";
 };
+
+export type TempoGuess = { bpm: number; offset: number };
 
 type AnalysisOptions = {
   signal?: AbortSignal;
@@ -38,11 +43,79 @@ function median(values: number[]) {
 }
 
 function throwIfAborted(signal?: AbortSignal) {
-  if (signal?.aborted) throw new DOMException("解析を中止しました", "AbortError");
+  if (signal?.aborted)
+    throw new DOMException("解析を中止しました", "AbortError");
 }
 
 function yieldToBrowser() {
   return new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+}
+
+function closestOnset(onsets: AnalysisBeat[], time: number, window: number) {
+  let closest: AnalysisBeat | null = null;
+  for (const onset of onsets) {
+    if (onset.time < time - window) continue;
+    if (onset.time > time + window) break;
+    if (!closest || onset.strength > closest.strength) closest = onset;
+  }
+  return closest;
+}
+
+/** BPMと先頭拍から一定間隔の譜面を作り、onsetは拍の強度と位相選択に使う。 */
+export function alignBeatsToTempoGrid(
+  onsets: AnalysisBeat[],
+  duration: number,
+  tempoGuess: TempoGuess,
+  isActive: (time: number) => boolean = () => true,
+) {
+  const { bpm, offset } = tempoGuess;
+  if (!Number.isFinite(bpm) || bpm <= 0 || !Number.isFinite(offset) || duration <= 0)
+    return [];
+
+  const baseInterval = 60 / bpm;
+  let interval = baseInterval;
+  let subdivision = 1;
+  // 高BPM曲を毎拍にすると手拍子が過密になるため、半テンポへ落とす。
+  while (interval < ANALYSIS.minimumBeatGap) {
+    interval += baseInterval;
+    subdivision += 1;
+  }
+
+  const normalizedOffset = ((offset % baseInterval) + baseInterval) % baseInterval;
+  const snapWindow = Math.min(0.1, baseInterval * 0.24);
+  let bestPhase = normalizedOffset;
+  let bestScore = -Infinity;
+
+  // 半テンポにした場合は、強いonsetが多い表拍側を選ぶ。
+  for (let phase = 0; phase < subdivision; phase += 1) {
+    const phaseOffset = normalizedOffset + phase * baseInterval;
+    let score = 0;
+    for (let time = phaseOffset; time < duration; time += interval) {
+      score += closestOnset(onsets, time, snapWindow)?.strength ?? 0;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestPhase = phaseOffset;
+    }
+  }
+
+  let firstTime = bestPhase;
+  while (firstTime < ANALYSIS.startPadding) firstTime += interval;
+  const beats: AnalysisBeat[] = [];
+  for (
+    let time = firstTime;
+    time <= duration - ANALYSIS.endPadding;
+    time += interval
+  ) {
+    const onset = closestOnset(onsets, time, snapWindow);
+    if (!onset && !isActive(time)) continue;
+    beats.push({
+      // 判定時刻は一定グリッドを守り、onsetは難易度/表示強度だけに使う。
+      time,
+      strength: onset ? clamp(0.35 + onset.strength * 0.65, 0.35, 1) : 0.28,
+    });
+  }
+  return beats;
 }
 
 /**
@@ -67,10 +140,14 @@ export async function analyzeTrack(
   try {
     buffer = await context.decodeAudioData(encoded);
   } finally {
-    void context.close();
+    await context.close();
   }
   throwIfAborted(signal);
   onProgress?.(0.14);
+  const tempoGuessPromise = guess(buffer, {
+    minTempo: 70,
+    maxTempo: 190,
+  }).catch(() => null);
 
   const channels = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
     buffer.getChannelData(index),
@@ -152,7 +229,16 @@ export async function analyzeTrack(
   );
   const rawCandidates: AnalysisBeat[] = [];
 
-  for (let index = Math.max(3, Math.floor(historyFrames / 3)); index < frameCount - 3; index += 1) {
+  for (
+    let index = Math.max(3, Math.floor(historyFrames / 3));
+    index < frameCount - 3;
+    index += 1
+  ) {
+    if (index % 640 === 0) {
+      onProgress?.(0.64 + (index / frameCount) * 0.27);
+      await yieldToBrowser();
+      throwIfAborted(signal);
+    }
     const value = novelty[index] ?? 0;
     if (
       value < (novelty[index - 1] ?? 0) ||
@@ -166,11 +252,12 @@ export async function analyzeTrack(
     const from = Math.max(0, index - historyFrames);
     const history = Array.from(novelty.subarray(from, index));
     const center = median(history);
-    const deviation = median(history.map((sample) => Math.abs(sample - center)));
-    const threshold = center + Math.max(
-      ANALYSIS.minimumNovelty,
-      deviation * ANALYSIS.thresholdMad,
+    const deviation = median(
+      history.map((sample) => Math.abs(sample - center)),
     );
+    const threshold =
+      center +
+      Math.max(ANALYSIS.minimumNovelty, deviation * ANALYSIS.thresholdMad);
     const energy = totalEnergy[index] ?? 0;
 
     if (value > threshold && energy > 0.004) {
@@ -181,38 +268,79 @@ export async function analyzeTrack(
       ) {
         rawCandidates.push({
           time,
-          strength: clamp((value - threshold) / Math.max(0.025, threshold), 0.08, 1),
+          strength: clamp(
+            (value - threshold) / Math.max(0.025, threshold),
+            0.08,
+            1,
+          ),
         });
       }
     }
+  }
 
-    if (index % 640 === 0) {
-      onProgress?.(0.64 + (index / frameCount) * 0.27);
-      await yieldToBrowser();
-      throwIfAborted(signal);
+  const onsetBeats: AnalysisBeat[] = [];
+  for (const candidate of rawCandidates) {
+    const previous = onsetBeats.at(-1);
+    if (
+      !previous ||
+      candidate.time - previous.time >= ANALYSIS.minimumBeatGap
+    ) {
+      onsetBeats.push(candidate);
+    } else if (candidate.strength > previous.strength) {
+      onsetBeats[onsetBeats.length - 1] = candidate;
     }
   }
 
-  const beats: AnalysisBeat[] = [];
-  for (const candidate of rawCandidates) {
-    const previous = beats.at(-1);
-    if (!previous || candidate.time - previous.time >= ANALYSIS.minimumBeatGap) {
-      beats.push(candidate);
-    } else if (candidate.strength > previous.strength) {
-      beats[beats.length - 1] = candidate;
+  onProgress?.(0.92);
+  const tempoGuess = await tempoGuessPromise;
+  throwIfAborted(signal);
+  const typicalEnergy = median(Array.from(totalEnergy));
+  const activityFloor = Math.max(0.0045, typicalEnergy * 0.18);
+  const isActive = (time: number) => {
+    const center = Math.round(time / frameDuration);
+    const radius = Math.max(1, Math.round(0.09 / frameDuration));
+    let peak = 0;
+    for (
+      let index = Math.max(0, center - radius);
+      index <= Math.min(totalEnergy.length - 1, center + radius);
+      index += 1
+    ) {
+      peak = Math.max(peak, totalEnergy[index] ?? 0);
     }
+    return peak >= activityFloor;
+  };
+
+  let beats = tempoGuess
+    ? alignBeatsToTempoGrid(rawCandidates, buffer.duration, tempoGuess, isActive)
+    : [];
+  let strategy: TrackAnalysis["strategy"] = "tempo-grid";
+  let tempo = tempoGuess?.bpm ?? 0;
+
+  // BPM推定が失敗した曲や、グリッド上に有効な拍がほとんどない曲は
+  // 従来のonset譜面へ戻す。ライブラリ障害でもゲーム開始を妨げない。
+  if (beats.length < Math.max(2, Math.floor(buffer.duration / 15))) {
+    beats = onsetBeats;
+    strategy = "onset";
   }
 
   // 無音や極端に滑らかな曲でもプロトタイプを開始不能にしない。
   // 検出が少ない場合は、区間内でもっとも強い立ち上がりを一定間隔で選ぶ。
   if (beats.length < Math.max(2, Math.floor(buffer.duration / 12))) {
     beats.length = 0;
-    const stepFrames = Math.max(1, Math.round(ANALYSIS.fallbackStep / frameDuration));
-    for (let start = Math.round(ANALYSIS.startPadding / frameDuration); start < frameCount; start += stepFrames) {
+    const stepFrames = Math.max(
+      1,
+      Math.round(ANALYSIS.fallbackStep / frameDuration),
+    );
+    for (
+      let start = Math.round(ANALYSIS.startPadding / frameDuration);
+      start < frameCount;
+      start += stepFrames
+    ) {
       const end = Math.min(frameCount, start + stepFrames);
       let bestIndex = start;
       for (let index = start + 1; index < end; index += 1) {
-        if ((novelty[index] ?? 0) > (novelty[bestIndex] ?? 0)) bestIndex = index;
+        if ((novelty[index] ?? 0) > (novelty[bestIndex] ?? 0))
+          bestIndex = index;
       }
       const time = (bestIndex + 0.5) * frameDuration;
       if (time > buffer.duration - ANALYSIS.endPadding) break;
@@ -221,21 +349,25 @@ export async function analyzeTrack(
         strength: clamp((novelty[bestIndex] ?? 0) / 0.18, 0.1, 0.72),
       });
     }
+    strategy = "onset";
   }
 
-  const intervals = beats
-    .slice(1)
-    .map((beat, index) => beat.time - (beats[index]?.time ?? 0))
-    .filter((interval) => interval > 0.3 && interval < 2.2);
-  let tempo = intervals.length > 0 ? 60 / median(intervals) : 0;
-  while (tempo > 180) tempo /= 2;
-  while (tempo > 0 && tempo < 70) tempo *= 2;
+  if (strategy === "onset") {
+    const intervals = beats
+      .slice(1)
+      .map((beat, index) => beat.time - (beats[index]?.time ?? 0))
+      .filter((interval) => interval > 0.3 && interval < 2.2);
+    tempo = intervals.length > 0 ? 60 / median(intervals) : 0;
+    while (tempo > 180) tempo /= 2;
+    while (tempo > 0 && tempo < 70) tempo *= 2;
+  }
 
   onProgress?.(1);
   return {
     beats,
     duration: buffer.duration,
     tempo: Math.round(tempo),
+    strategy,
   };
 }
 
@@ -327,10 +459,18 @@ export class MicrophoneInput {
       this.state = "unsupported";
       return false;
     }
-    if (this.context && this.stream) {
+    if (this.context && this.stream?.active) {
       await this.context.resume();
       this.state = "active";
       return true;
+    }
+    if (this.context || this.stream) {
+      this.stream?.getTracks().forEach((track) => track.stop());
+      this.stream = null;
+      this.analyser = null;
+      this.samples = null;
+      if (this.context) await this.context.close();
+      this.context = null;
     }
 
     this.state = "requesting";
@@ -343,13 +483,19 @@ export class MicrophoneInput {
   }
 
   pause() {
-    if (!this.context || this.state === "denied" || this.state === "unsupported") return;
+    if (
+      !this.context ||
+      this.state === "denied" ||
+      this.state === "unsupported"
+    )
+      return;
     void this.context.suspend();
     this.state = "paused";
   }
 
   update(now: number) {
-    if (!this.analyser || !this.samples || this.context?.state !== "running") return false;
+    if (!this.analyser || !this.samples || this.context?.state !== "running")
+      return false;
     this.analyser.getFloatTimeDomainData(this.samples);
 
     let squares = 0;
@@ -376,9 +522,14 @@ export class MicrophoneInput {
       this.state = "active";
     }
 
-    this.threshold = Math.max(0.014, this.noiseFloor * 3.1, this.slowLevel * 1.65);
+    this.threshold = Math.max(
+      0.014,
+      this.noiseFloor * 3.1,
+      this.slowLevel * 1.65,
+    );
     const rising = rms > this.previousLevel * 1.22 + 0.0015;
-    const transient = rms > this.threshold && peak > Math.max(0.1, this.threshold * 2.1);
+    const transient =
+      rms > this.threshold && peak > Math.max(0.1, this.threshold * 2.1);
     const canTrigger = this.armed && now - this.lastTriggerAt > 170;
     const triggered = canTrigger && rising && transient;
 

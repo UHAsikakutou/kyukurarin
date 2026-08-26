@@ -3,13 +3,58 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>p5 Wave Player</title>
-    <style>html,body{margin:0;overflow:hidden;background:#11100f}canvas{display:block}</style>
+    <meta
+      name="description"
+      content="曲のリズムに合わせて手拍子し、きゅうくらりん風の画像列をつなぐp5.jsリズムゲーム"
+    />
+    <meta name="theme-color" content="#f2eee7" />
+    <title>きゅうくらりん Rhythm Archive</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #f2eee7;
+        color: #100f12;
+        overscroll-behavior: none;
+      }
+
+      body {
+        font-family: "Arial Narrow", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+      }
+
+      #app,
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      canvas {
+        touch-action: none;
+        outline: none;
+      }
+
+      .visually-hidden {
+        position: fixed;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+    </style>
   </head>
   <body>
-    <main id="app"></main>
-    <input id="audio-file" type="file" accept="audio/*" hidden />
+    <main id="app" aria-label="きゅうくらりんリズムゲーム"></main>
+    <input id="audio-file" type="file" accept="audio/*" class="visually-hidden" tabindex="-1" />
     <audio id="audio" preload="metadata"></audio>
+    <div id="live-region" class="visually-hidden" aria-live="polite"></div>
     <script type="module" src="./index.ts"></script>
   </body>
 </html>
