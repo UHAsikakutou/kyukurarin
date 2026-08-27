@@ -51,6 +51,12 @@ export type TrackAnalysis = {
  */
 export type TempoGuess = { bpm: number; offset: number };
 
+/** 曲中の一部分だけで推定したテンポ。offsetは曲頭を0とした絶対時刻。 */
+export type TempoSegment = TempoGuess & {
+  start: number;
+  end: number;
+};
+
 type AnalysisOptions = {
   /** 別の曲が選ばれたとき、時間のかかる解析を途中で打ち切るために使う。 */
   signal?: AbortSignal;
@@ -75,12 +81,19 @@ const ANALYSIS = {
   // tempo-gridと第1onsetフォールバックで保証する最小間隔（秒）。
   // 最終0.82秒区間フォールバックには適用せず、近接する場合もある。
   minimumBeatGap: 0.48,
+  // 強い裏拍・シンコペーションを追加するときの、操作可能性を保つ最小間隔。
+  // 等間隔の主拍より短いが、約4.2回/秒を超える連打は要求しない。
+  minimumPatternGap: 0.24,
   // 最終フォールバックで、判定点を1個ずつ探す区間の長さ（秒）。
   fallbackStep: 0.82,
   // 曲頭は解析履歴が不足し、開始直後の入力も難しいため判定点から除外する。
   startPadding: 0.38,
   // MISS確定に必要な遅判定200msを曲末より前にほぼ確保する余白。
   endPadding: 0.24,
+  // 単一BPMを全曲へ固定しないため、区間がこの長さ以下になるよう再推定する。
+  tempoSegmentSeconds: 18,
+  // 2区間ともこの長さ以上にできる曲から、区間別推定を有効にする。
+  minimumTempoSegmentSeconds: 8,
 };
 
 /** 経験的に算出したonset候補・表示用strengthを、扱いやすい範囲へ収める。 */
@@ -109,27 +122,43 @@ function yieldToBrowser() {
 }
 
 /**
- * `time` 前後の窓にあるonsetのうち、時刻が最も近いものではなく最も強いものを
- * 返す。1つの拍の近くに候補が複数あっても、位相評価、グリッド点を残す判断、
- * 表示強度に使う代表を1つにするためである。`onsets` は時刻順であることを
- * 前提に、探索を早く終える。
+ * `time` 前後の窓にあるonsetのうち、最も近いものを返す。時刻差が8ms以内の
+ * 候補だけは強い方を選ぶ。`onsets` は時刻順であることを前提に探索を早く終える。
  */
 function closestOnset(onsets: AnalysisBeat[], time: number, window: number) {
   let closest: AnalysisBeat | null = null;
+  let closestDistance = Infinity;
   for (const onset of onsets) {
     if (onset.time < time - window) continue;
     if (onset.time > time + window) break;
-    if (!closest || onset.strength > closest.strength) closest = onset;
+    const distance = Math.abs(onset.time - time);
+    // 拍線への対応付けでは、大きいが遠い音より近い立ち上がりを優先する。
+    // ほぼ同時刻の候補だけはstrengthをタイブレークに使う。
+    if (
+      distance < closestDistance - 0.008 ||
+      (Math.abs(distance - closestDistance) <= 0.008 &&
+        (!closest || onset.strength > closest.strength))
+    ) {
+      closest = onset;
+      closestDistance = distance;
+    }
   }
   return closest;
 }
 
+function distanceToNearestBeat(beats: AnalysisBeat[], time: number) {
+  let distance = Infinity;
+  for (const beat of beats)
+    distance = Math.min(distance, Math.abs(beat.time - time));
+  return distance;
+}
+
 /**
- * 推定BPMと周期グリッドの基準位置から、一定間隔のゲーム用判定点を作る。
+ * 推定BPMと周期グリッドを骨格に、onsetへ追従するゲーム用判定点を作る。
  *
  * `60 / bpm` で1拍の秒数を求める。ただし速い曲は何拍かおきに間引き、onset
- * （音量が急に立ち上がった時刻）が多く重なる位相を選ぶ。onsetそのものへ判定
- * 時刻をずらさないので、最終的な判定点は一定間隔を保つ。
+ * （音量が急に立ち上がった時刻）が多く重なる位相を選ぶ。近くにonsetがあれば
+ * 実際の立ち上がりへ時刻を寄せ、強い裏拍も追加する。
  *
  * @param onsets 時刻と相対強度を持つonset候補。時刻の昇順で渡す。
  * @param duration 曲長（秒）。曲末より後の判定点を作らないために使う。
@@ -142,6 +171,10 @@ export function alignBeatsToTempoGrid(
   duration: number,
   tempoGuess: TempoGuess,
   isActive: (time: number) => boolean = () => true,
+  padding = {
+    start: ANALYSIS.startPadding,
+    end: ANALYSIS.endPadding,
+  },
 ) {
   const { bpm, offset } = tempoGuess;
   if (!Number.isFinite(bpm) || bpm <= 0 || !Number.isFinite(offset) || duration <= 0)
@@ -173,7 +206,13 @@ export function alignBeatsToTempoGrid(
     const phaseOffset = normalizedOffset + phase * baseInterval;
     let score = 0;
     for (let time = phaseOffset; time < duration; time += interval) {
-      score += closestOnset(onsets, time, snapWindow)?.strength ?? 0;
+      const onset = closestOnset(onsets, time, snapWindow);
+      if (onset) {
+        // 同じ強さなら拍線に近いonsetが多い位相を選ぶ。遠い候補が偶然窓へ
+        // 入っただけの位相を採りにくくするための距離重みである。
+        const proximity = 1 - Math.abs(onset.time - time) / snapWindow;
+        score += onset.strength * (0.45 + proximity * 0.55);
+      }
     }
     if (score > bestScore) {
       bestScore = score;
@@ -183,25 +222,161 @@ export function alignBeatsToTempoGrid(
 
   // 曲頭の操作時間を避けつつ、選んだグリッドの位相は変えない。
   let firstTime = bestPhase;
-  while (firstTime < ANALYSIS.startPadding) firstTime += interval;
+  while (firstTime < padding.start) firstTime += interval;
   const beats: AnalysisBeat[] = [];
+  // ごく少数の誤検出1個だけでグリッドを間引かない。曲長に応じた最低数を
+  // 超えた場合だけ、onset列が曲のリズムを表せているとみなす。
+  const hasRhythmicOnsets =
+    onsets.length >= Math.max(2, Math.floor(duration / 8));
+  let gridIndex = 0;
   for (
     let time = firstTime;
-    time <= duration - ANALYSIS.endPadding;
+    time <= duration - padding.end;
     time += interval
   ) {
     const onset = closestOnset(onsets, time, snapWindow);
     // 近くにonsetがなく、周辺もほぼ無音なら、休符に判定点を置かない。
-    if (!onset && !isActive(time)) continue;
+    if (!onset && !isActive(time)) {
+      gridIndex += 1;
+      continue;
+    }
+    // onsetが十分取れている曲で「音が鳴っている」だけの全拍を残すと、解析した
+    // リズムを覆い隠す等間隔譜面になる。onsetなしは4格子に1つの骨格音だけ残す。
+    // onset自体が取れない曲では、従来どおりグリッドをフォールバックにする。
+    if (!onset && hasRhythmicOnsets && gridIndex % 4 !== 0) {
+      gridIndex += 1;
+      continue;
+    }
     beats.push({
-      // onsetの有無は直前でグリッド点を残す判断にも使ったが、採用後の時刻は
-      // 一定グリッドから動かさない。出力値には表示用strengthだけを反映する。
-      // onsetなしでも音が続いている点は、弱い線（0.28）として残す。
-      time,
+      // テンポ格子は拍の所属を決める基準として使い、最終判定は実際の音の
+      // 立ち上がりへ合わせる。これで演奏の微細な前ノリ・後ノリを消さない。
+      time: onset?.time ?? time,
       strength: onset ? clamp(0.35 + onset.strength * 0.65, 0.35, 1) : 0.28,
     });
+    gridIndex += 1;
   }
+
+  // 格子から外れた強いonsetは、裏拍やシンコペーションである可能性が高い。
+  // 代表的な強さ（中央値）以上だけを、既存ノートとの操作間隔を守って追加する。
+  const salientFloor = Math.max(
+    0.42,
+    median(onsets.map((onset) => onset.strength)),
+  );
+  for (const onset of onsets) {
+    if (
+      onset.strength < salientFloor ||
+      onset.time < padding.start ||
+      onset.time > duration - padding.end ||
+      distanceToNearestBeat(beats, onset.time) < ANALYSIS.minimumPatternGap
+    ) {
+      continue;
+    }
+    beats.push({ ...onset });
+  }
+
+  beats.sort((left, right) => left.time - right.time);
   return beats;
+}
+
+/**
+ * 区間ごとのBPMを、それぞれ対応する曲時刻にだけ適用して譜面をつなぐ。
+ * 区間境界は半開区間として扱い、同じonsetやグリッド点を二重登録しない。
+ */
+export function alignBeatsToTempoMap(
+  onsets: AnalysisBeat[],
+  duration: number,
+  segments: TempoSegment[],
+  isActive: (time: number) => boolean = () => true,
+) {
+  const beats: AnalysisBeat[] = [];
+
+  for (const segment of segments) {
+    const start = Math.max(0, segment.start);
+    const end = Math.min(duration, segment.end);
+    if (end <= start) continue;
+
+    // alignBeatsToTempoGridは0秒始まりの曲を扱う関数なので、区間内の時刻へ
+    // 一度移し、生成後に曲全体の絶対時刻へ戻す。
+    const localOnsets = onsets
+      .filter((onset) => onset.time >= start && onset.time < end)
+      .map((onset) => ({ ...onset, time: onset.time - start }));
+    const localDuration = end - start;
+    const localOffset = segment.offset - start;
+    const localBeats = alignBeatsToTempoGrid(
+      localOnsets,
+      localDuration,
+      { bpm: segment.bpm, offset: localOffset },
+      (time) => isActive(time + start),
+      {
+        // 操作余白は分析区間ごとではなく、実際の曲頭・曲末にだけ設ける。
+        start: start === 0 ? ANALYSIS.startPadding : 0,
+        end: end >= duration ? ANALYSIS.endPadding : 0,
+      },
+    );
+
+    for (const beat of localBeats) {
+      const time = beat.time + start;
+      const isLastSegment = end >= duration;
+      if (
+        time < Math.max(start, ANALYSIS.startPadding) ||
+        time < start ||
+        time >= end ||
+        (isLastSegment && time > duration - ANALYSIS.endPadding)
+      ) {
+        continue;
+      }
+      // 推定誤差で境界付近の点がほぼ重なった場合も、操作不能な二重ノートにしない。
+      if (distanceToNearestBeat(beats, time) < ANALYSIS.minimumPatternGap)
+        continue;
+      beats.push({ ...beat, time });
+    }
+  }
+
+  beats.sort((left, right) => left.time - right.time);
+  return beats;
+}
+
+/** 長い曲を連続区間へ分け、各区間のテンポを独立に推定する。 */
+async function guessTempoMap(buffer: AudioBuffer) {
+  const settings = { minTempo: 70, maxTempo: 190 };
+  const wholeTrackGuess = await guess(buffer, settings).catch(() => null);
+  if (buffer.duration < ANALYSIS.minimumTempoSegmentSeconds * 2)
+    return {
+      wholeTrackGuess,
+      segments: wholeTrackGuess
+        ? [{ ...wholeTrackGuess, start: 0, end: buffer.duration }]
+        : [],
+    };
+
+  // 末尾だけが短い固定長分割ではなく、曲長を均等に割る。例えば20秒なら
+  // 10秒ずつになり、後半区間にも推定に必要な材料を確保できる。
+  const segmentCount = Math.ceil(buffer.duration / ANALYSIS.tempoSegmentSeconds);
+  const ranges = Array.from({ length: segmentCount }, (_, index) => ({
+    start: (buffer.duration * index) / segmentCount,
+    end: (buffer.duration * (index + 1)) / segmentCount,
+  }));
+
+  // 同時に多数のOfflineAudioContextを作ると長い曲でメモリを圧迫するため逐次実行。
+  const segments: TempoSegment[] = [];
+  for (const range of ranges) {
+    const local = await guess(
+      buffer,
+      range.start,
+      range.end - range.start,
+      settings,
+    ).catch(() => null);
+    const selected = local ?? wholeTrackGuess;
+    if (!selected) continue;
+    segments.push({
+      bpm: selected.bpm,
+      // 区間解析のoffsetは区間頭を0とするため、曲全体の時刻へ戻す。
+      // 全曲推定へ退避した場合のoffsetは、すでに曲頭基準なので加算しない。
+      offset: local ? range.start + local.offset : selected.offset,
+      ...range,
+    });
+  }
+
+  return { wholeTrackGuess, segments };
 }
 
 /**
@@ -209,7 +384,7 @@ export function alignBeatsToTempoGrid(
  *
  * 処理は大きく次の順番で進む。
  *
- * 1. 音声をサンプル列へデコードし、左右などのチャンネルを平均する。
+ * 1. 音声をサンプル列へデコードし、左右などを別々にパワー解析する。
  * 2. 512サンプルずつ、低・中・高域と全体のRMS（実効振幅）を求める。
  * 3. 各帯域のRMSが急に増えた瞬間をonset候補として抽出する。
  * 4. 推定BPMの等間隔グリッドとonsetを組み合わせ、遊びやすい判定点にする。
@@ -246,10 +421,7 @@ export async function analyzeTrack(
   // 外部ライブラリのBPM推定は、この下のonset解析と並行して進める。
   // 推定失敗を例外のままにせずnullへ変え、後段のonset方式へ退避可能にする。
   // 推定候補は70〜190 BPMに限定し、極端に遅い・速い値を譜面の基準にしない。
-  const tempoGuessPromise = guess(buffer, {
-    minTempo: 70,
-    maxTempo: 190,
-  }).catch(() => null);
+  const tempoMapPromise = guessTempoMap(buffer);
 
   const channels = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
     buffer.getChannelData(index),
@@ -274,8 +446,11 @@ export async function analyzeTrack(
   // おおよそ低域（キック）・中域・高域（手拍子等）の3つへ分ける。
   const bassAlpha = 1 - Math.exp((-2 * Math.PI * 220) / sampleRate);
   const midAlpha = 1 - Math.exp((-2 * Math.PI * 2400) / sampleRate);
-  let bassState = 0;
-  let midState = 0;
+  // チャンネルを波形として先に足すと、左右が逆位相の成分は0へ近づく。
+  // 各チャンネルを別々にフィルター・二乗してから平均し、定位に依存しない
+  // パワー（RMS）として打音を測る。
+  const bassStates = new Float64Array(channels.length);
+  const midStates = new Float64Array(channels.length);
 
   for (let frame = 0; frame < frameCount; frame += 1) {
     const start = frame * frameSize;
@@ -287,31 +462,33 @@ export async function analyzeTrack(
     let totalSum = 0;
 
     for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
-      // 左右など全チャンネルを同じ重みで平均し、解析用モノラル波形にする。
-      // 再生音は変更せず、判定点を探す計算だけを簡単にするための変換である。
-      let sample = 0;
-      for (const channel of channels) sample += channel[sampleIndex] ?? 0;
-      sample /= Math.max(1, channels.length);
-
-      bassState += bassAlpha * (sample - bassState);
-      midState += midAlpha * (sample - midState);
-      // 2400Hz以下の成分から220Hz以下を引けば中域が、原音から
-      // 2400Hz以下を引けば高域が近似できる。3つを足すと元のsampleに戻る。
-      const bass = bassState;
-      const mid = midState - bassState;
-      const high = sample - midState;
-      bassSum += bass * bass;
-      midSum += mid * mid;
-      highSum += high * high;
-      totalSum += sample * sample;
+      for (let channelIndex = 0; channelIndex < channels.length; channelIndex += 1) {
+        const sample = channels[channelIndex]?.[sampleIndex] ?? 0;
+        const bassState =
+          (bassStates[channelIndex] ?? 0) +
+          bassAlpha * (sample - (bassStates[channelIndex] ?? 0));
+        const midState =
+          (midStates[channelIndex] ?? 0) +
+          midAlpha * (sample - (midStates[channelIndex] ?? 0));
+        bassStates[channelIndex] = bassState;
+        midStates[channelIndex] = midState;
+        const bass = bassState;
+        const mid = midState - bassState;
+        const high = sample - midState;
+        bassSum += bass * bass;
+        midSum += mid * mid;
+        highSum += high * high;
+        totalSum += sample * sample;
+      }
     }
 
     // RMS = sqrt((x1^2 + ... + xN^2) / N)。正負に振動する波形を単純平均すると
     // ほぼ0になるため、二乗してから平均し、この区間の音量の目安にする。
-    bassEnergy[frame] = Math.sqrt(bassSum / count);
-    midEnergy[frame] = Math.sqrt(midSum / count);
-    highEnergy[frame] = Math.sqrt(highSum / count);
-    totalEnergy[frame] = Math.sqrt(totalSum / count);
+    const powerCount = count * Math.max(1, channels.length);
+    bassEnergy[frame] = Math.sqrt(bassSum / powerCount);
+    midEnergy[frame] = Math.sqrt(midSum / powerCount);
+    highEnergy[frame] = Math.sqrt(highSum / powerCount);
+    totalEnergy[frame] = Math.sqrt(totalSum / powerCount);
 
     // 数百区間ごとにUIへ制御を返し、長い曲でも進捗描画や中止操作を止めない。
     if (frame % 480 === 0) {
@@ -431,7 +608,8 @@ export async function analyzeTrack(
   }
 
   onProgress?.(0.92);
-  const tempoGuess = await tempoGuessPromise;
+  const { wholeTrackGuess: tempoGuess, segments: tempoSegments } =
+    await tempoMapPromise;
   throwIfAborted(signal);
   // 曲全体の典型的RMSを基準にしつつ、極端に小さくならない下限を持たせる。
   // 一時的な大音量に左右されにくいよう平均ではなく中央値を用いる。
@@ -455,11 +633,13 @@ export async function analyzeTrack(
 
   // グリッドの位相選択には、0.48秒へ間引く前の細かな候補を渡す。
   // `onsetBeats` はBPMグリッドが成立しなかった場合にだけ使う退避先である。
-  let beats = tempoGuess
-    ? alignBeatsToTempoGrid(rawCandidates, buffer.duration, tempoGuess, isActive)
+  let beats = tempoSegments.length > 0
+    ? alignBeatsToTempoMap(rawCandidates, buffer.duration, tempoSegments, isActive)
     : [];
   let strategy: TrackAnalysis["strategy"] = "tempo-grid";
-  let tempo = tempoGuess?.bpm ?? 0;
+  let tempo =
+    tempoGuess?.bpm ??
+    median(tempoSegments.map((segment) => segment.bpm));
 
   // BPM推定が失敗した曲や、有効なグリッド点が曲長に対して少なすぎる曲は、
   // 最小0.48秒の間隔へ整理済みのonset列を判定点として使う。外部ライブラリの
@@ -611,6 +791,14 @@ export type MicrophoneState =
   | "denied"
   | "unsupported";
 
+/** マイクメーターと手動閾値スライダーが扱う相対RMSの範囲。 */
+export const MICROPHONE_THRESHOLD_RANGE = {
+  minimum: 0.006,
+  maximum: 0.12,
+} as const;
+
+export type MicrophoneThresholdMode = "automatic" | "manual";
+
 /**
  * マイク波形から、手拍子のように急に大きくなる打撃音を検出する。
  *
@@ -626,6 +814,10 @@ export class MicrophoneInput {
   level = 0;
   /** 現在の環境音から決めたRMS閾値。検出とメーターの目盛りに使う。 */
   threshold = 0.025;
+  /** 自動追従か、プレイヤーがバーで指定した固定値かをUIへ知らせる。 */
+  thresholdMode: MicrophoneThresholdMode = "automatic";
+  /** getUserMedia / MediaStreamTrackへ希望するノイズ抑制の状態。 */
+  noiseSuppression = false;
 
   // context/analyser/streamはリアルタイム波形を読むためのWeb Audio経路。
   private context: AudioContext | null = null;
@@ -650,6 +842,38 @@ export class MicrophoneInput {
   private armed = true;
   // 再待機に必要な「静かな状態」が始まった時刻（ミリ秒）。
   private quietSince = 0;
+
+  /** バー操作で指定された値を安全な範囲へ収め、動的閾値の代わりに使う。 */
+  setManualThreshold(value: number) {
+    this.thresholdMode = "manual";
+    this.threshold = clamp(
+      value,
+      MICROPHONE_THRESHOLD_RANGE.minimum,
+      MICROPHONE_THRESHOLD_RANGE.maximum,
+    );
+  }
+
+  /** 初期調整とプレイ中の環境音追従から閾値を決める状態へ戻す。 */
+  useAutomaticThreshold() {
+    this.thresholdMode = "automatic";
+    this.threshold = this.calculateAutomaticThreshold();
+  }
+
+  /**
+   * 次回取得時の希望値を更新し、取得済みなら現在の音声トラックにも要求する。
+   * ブラウザや端末が対応しない場合があるため、適用の成否を呼び出し側へ返す。
+   */
+  async setNoiseSuppression(enabled: boolean) {
+    this.noiseSuppression = enabled;
+    const track = this.stream?.getAudioTracks()[0];
+    if (!track) return true;
+    try {
+      await track.applyConstraints({ noiseSuppression: { ideal: enabled } });
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   async start() {
     // 同じ状態での多重開始を避ける。startPromiseは許可ダイアログ表示中の
@@ -746,11 +970,8 @@ export class MicrophoneInput {
     // 判定閾値は、固定下限・初期/更新済み環境音・最近の持続音のうち
     // 最も大きい基準を採る。静かな部屋でも敏感になりすぎず、環境音が
     // 大きい部屋でもそれを手拍子と誤認しにくくする。
-    this.threshold = Math.max(
-      0.014,
-      this.noiseFloor * 3.1,
-      this.slowLevel * 1.65,
-    );
+    const automaticThreshold = this.calculateAutomaticThreshold();
+    if (this.thresholdMode === "automatic") this.threshold = automaticThreshold;
     // 単に大きい音ではなく、1回前のupdateから急上昇したことを要求する。
     // これにより会話や持続音より、打撃音の立ち上がりを優先する。
     const rising = rms > this.previousLevel * 1.22 + 0.0015;
@@ -779,7 +1000,7 @@ export class MicrophoneInput {
     // 手拍子候補を除いた比較的静かな入力だけで、プレイ中もnoiseFloorを更新する。
     // 現在値より静かなら速めに下げ、少し騒がしくなった場合はゆっくり上げる。
     // 突発音1回で基準が跳ね上がり、その後の手拍子を見失うことを避けるため。
-    if (!triggered && rms < this.threshold * 0.78) {
+    if (!triggered && rms < automaticThreshold * 0.78) {
       const rate = rms < this.noiseFloor ? 0.025 : 0.004;
       this.noiseFloor += (rms - this.noiseFloor) * rate;
     }
@@ -801,17 +1022,25 @@ export class MicrophoneInput {
     this.state = "off";
   }
 
+  private calculateAutomaticThreshold() {
+    return Math.max(
+      0.014,
+      this.noiseFloor * 3.1,
+      this.slowLevel * 1.65,
+    );
+  }
+
   private async createStream() {
     try {
       // すべてideal（希望値）なので端末が満たす保証はない。モノラル化で処理を
       // 単純にし、echoCancellationで曲のスピーカー回り込みを減らす。一方、
-      // 手拍子の急上昇と自前の閾値調整を保つため、ノイズ抑制と自動音量調整は
-      // 無効を希望する。
+      // 手拍子の急上昇と自前の閾値調整を保つため自動音量調整は無効を希望する。
+      // ノイズ抑制はUIの選択を渡し、既定では無効を希望する。
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: { ideal: 1 },
           echoCancellation: { ideal: true },
-          noiseSuppression: { ideal: false },
+          noiseSuppression: { ideal: this.noiseSuppression },
           autoGainControl: { ideal: false },
         },
       });

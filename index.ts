@@ -7,6 +7,7 @@ import art5Url from "./public/5.PNG" with { type: "file" };
 import art6Url from "./public/6.PNG" with { type: "file" };
 import art7Url from "./public/7.PNG" with { type: "file" };
 import {
+  MICROPHONE_THRESHOLD_RANGE,
   MicrophoneInput,
   TrackPlayer,
   analyzeTrack,
@@ -21,8 +22,10 @@ import {
   type PieceVisibility,
 } from "./src/game";
 
+/** p5キャンバス上の矩形領域。座標と寸法はCSSピクセル相当。 */
 type Rect = { x: number; y: number; w: number; h: number };
 
+/** 現在のウィンドウ寸法から計算した、主要UI領域の配置。 */
 type Layout = {
   compact: boolean;
   margin: number;
@@ -38,6 +41,7 @@ type Layout = {
   showMicPanel: boolean;
 };
 
+/** 画像URLと、元画像から人物を切り抜く範囲。 */
 type ArtSpec = {
   url: string;
   crop: { x: number; y: number; w: number; h: number };
@@ -73,24 +77,29 @@ const MOTION = {
   settleAt: 140,
 };
 
+/** 必須DOM要素を取得し、HTMLとの不整合を起動直後に明示する。 */
 function requireElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) throw new Error(`${selector} が見つかりません`);
   return element;
 }
 
+/** 数値を両端を含む指定範囲へ収める。 */
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+/** 速く始まり緩やかに終わる、0〜1の3次イージング。 */
 function easeOutCubic(value: number) {
   return 1 - (1 - value) ** 3;
 }
 
+/** 緩やかに始まり速く終わる、0〜1の3次イージング。 */
 function easeInCubic(value: number) {
   return value ** 3;
 }
 
+/** 秒数を再生時間表示用の `分:秒` に変換する。 */
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds)) return "0:00";
   const safe = Math.max(0, seconds);
@@ -99,6 +108,7 @@ function formatTime(seconds: number) {
     .padStart(2, "0")}`;
 }
 
+/** ゲームフェーズをヘッダー用の短い英語ラベルへ変換する。 */
 function phaseLabel(phase: GamePhase) {
   const labels: Record<GamePhase, string> = {
     idle: "NO TRACK",
@@ -129,15 +139,21 @@ let errorMessage = "";
 let lastInputAt = -Infinity;
 let pieceVisibility: PieceVisibility | undefined;
 
+/** スクリーンリーダー向けライブ領域へ状態変化を通知する。 */
 function announce(message: string) {
   liveRegion.textContent = message;
 }
 
+/** 同じファイルも再選択できるよう値を消してからファイル選択を開く。 */
 function openFilePicker() {
   fileInput.value = "";
   fileInput.click();
 }
 
+/**
+ * 選択された音声を再生用に登録し、解析からゲーム譜面の設定まで行う。
+ * 後から別の曲が選ばれた場合は古い解析を中止し、その結果を採用しない。
+ */
 async function loadTrack(file: File) {
   analysisController?.abort();
   const controller = new AbortController();
@@ -174,6 +190,7 @@ async function loadTrack(file: File) {
   }
 }
 
+/** 再生・マイク・ゲーム時計をそろえて一時停止する。 */
 function pauseGame() {
   if (game.phase !== "playing") return;
   track.pause();
@@ -182,6 +199,7 @@ function pauseGame() {
   announce("一時停止しました");
 }
 
+/** マイク権限を要求し、環境音を測る初期調整を開始する。 */
 async function prepareMicrophone() {
   if (game.phase !== "ready" || microphone.state !== "off") return;
   announce("マイクの許可を待っています");
@@ -197,6 +215,7 @@ async function prepareMicrophone() {
   );
 }
 
+/** 現在のフェーズに応じて、マイク準備または再生開始を実行する。 */
 function activatePrimaryAction() {
   if (game.phase === "ready") {
     if (microphone.state === "off") {
@@ -209,6 +228,10 @@ function activatePrimaryAction() {
   void beginPlayback();
 }
 
+/**
+ * 新規プレイまたは一時停止位置から、音声とゲームを開始する。
+ * @param useMicrophone `false` ならマイクを起動せず手動入力だけで遊ぶ。
+ */
 async function beginPlayback(useMicrophone = true) {
   if (!analysis) return;
   if (game.phase === "playing") {
@@ -241,8 +264,7 @@ async function beginPlayback(useMicrophone = true) {
 
   try {
     await playback;
-    if (track.playing)
-      announce("ゲーム開始。曲に合わせて手拍子してください");
+    if (track.playing) announce("ゲーム開始。曲に合わせて手拍子してください");
   } catch (error) {
     if (game.phase === "paused") return;
     track.pause();
@@ -256,6 +278,7 @@ async function beginPlayback(useMicrophone = true) {
   }
 }
 
+/** 曲末の未確定判定を処理し、クリアまたはゲームオーバーを通知する。 */
 function finishGame() {
   const result = game.finish(performance.now(), pieceVisibility);
   microphone.pause();
@@ -264,6 +287,10 @@ function finishGame() {
     announce("ゲームオーバー。画面に画像が残りませんでした");
 }
 
+/**
+ * マイクまたは手動操作の1入力を、現在の再生時刻でゲームへ渡す。
+ * マイク入力だけは検出・処理遅延の概算として35ms早める。
+ */
 function registerHit(source: "mic" | "manual") {
   if (game.phase !== "playing") return;
   const now = performance.now();
@@ -298,7 +325,9 @@ document.addEventListener("visibilitychange", () => {
 new p5((p) => {
   let images: p5.Image[] = [];
   let failedAssets = 0;
+  let thresholdDragging = false;
 
+  /** ウィンドウ寸法から、通常表示またはコンパクト表示の配置を作る。 */
   function createLayout(): Layout {
     const compact = p.width < 720 || p.height < 610;
     const margin = compact ? 10 : 22;
@@ -368,6 +397,7 @@ new p5((p) => {
     };
   }
 
+  /** 現在のポインター座標が矩形内にあるかを返す。 */
   function pointIn(rect: Rect) {
     return (
       p.mouseX >= rect.x &&
@@ -377,6 +407,56 @@ new p5((p) => {
     );
   }
 
+  /** マイクパネル内の入力レベル・閾値メーター領域を返す。 */
+  function microphoneMeter(layout: Layout): Rect {
+    return { x: layout.mic.x, y: layout.mic.y + 28, w: layout.mic.w, h: 8 };
+  }
+
+  /** ノイズ抑制切り替えボタンの操作領域を返す。 */
+  function noiseSuppressionToggle(layout: Layout): Rect {
+    return {
+      x: layout.mic.x + layout.mic.w - 52,
+      y: layout.mic.y - 1,
+      w: 52,
+      h: 17,
+    };
+  }
+
+  /** 手動閾値から自動調整へ戻すボタンの操作領域を返す。 */
+  function automaticThresholdButton(layout: Layout): Rect {
+    return {
+      x: layout.mic.x + layout.mic.w - 34,
+      y: layout.mic.y + 39,
+      w: 34,
+      h: 15,
+    };
+  }
+
+  /** メーター上のポインター位置をマイクの手動閾値へ変換する。 */
+  function setThresholdFromPointer(layout: Layout) {
+    const meter = microphoneMeter(layout);
+    const ratio = clamp((p.mouseX - meter.x) / meter.w, 0, 1);
+    const { minimum, maximum } = MICROPHONE_THRESHOLD_RANGE;
+    microphone.setManualThreshold(minimum + ratio * (maximum - minimum));
+  }
+
+  /** ノイズ抑制の希望値を反転し、適用結果を読み上げる。 */
+  async function toggleNoiseSuppression() {
+    if (microphone.state === "requesting") return;
+    const enabled = !microphone.noiseSuppression;
+    const applied = await microphone.setNoiseSuppression(enabled);
+    if (applied) {
+      announce(
+        `ブラウザへノイズ抑制${enabled ? "有効" : "無効"}を要求しました`,
+      );
+    } else {
+      announce(
+        `ノイズ抑制${enabled ? "有効" : "無効"}は現在のマイクへ適用できませんでした`,
+      );
+    }
+  }
+
+  /** 幅に収まらない文字列を末尾の省略記号付きで短縮する。 */
   function fitText(text: string, maximumWidth: number) {
     if (p.textWidth(text) <= maximumWidth) return text;
     let output = text;
@@ -386,6 +466,7 @@ new p5((p) => {
     return `${output}…`;
   }
 
+  /** 共通の矩形ボタンを、ホバー・強調・無効状態に応じて描画する。 */
   function drawButton(
     rect: Rect,
     label: string,
@@ -409,6 +490,7 @@ new p5((p) => {
     p.text(label, rect.x + rect.w / 2, rect.y + rect.h / 2 + 0.5);
   }
 
+  /** タイトル、ゲーム状態、曲選択ボタンを含むヘッダーを描画する。 */
   function drawHeader(layout: Layout) {
     p.noStroke();
     p.fill(COLORS.paper);
@@ -444,6 +526,7 @@ new p5((p) => {
     drawButton(layout.upload, "＋  曲を選ぶ");
   }
 
+  /** 1920×1080基準の画像配置を現在のステージ寸法へ写す値を計算する。 */
   function visualMetrics(stage: Rect) {
     const scale = Math.min(stage.h / 1080, stage.w / 1260);
     const aspect = stage.w / Math.max(1, stage.h);
@@ -456,6 +539,7 @@ new p5((p) => {
     };
   }
 
+  /** 現在のレスポンシブ配置で、画像の横幅がステージと交差するか調べる。 */
   function isPieceVisible(layout: Layout, piece: GamePiece) {
     const spec = ART[piece.imageIndex];
     if (!spec) return false;
@@ -469,6 +553,7 @@ new p5((p) => {
     );
   }
 
+  /** 5つの論理列の基準位置をステージ下端へ短い目盛りとして描く。 */
   function drawSlotGuides(layout: Layout) {
     const metrics = visualMetrics(layout.stage);
     p.stroke(255, 255, 255, 45);
@@ -481,6 +566,10 @@ new p5((p) => {
     p.noStroke();
   }
 
+  /**
+   * 生成直後の画像について、落下・行き過ぎ・跳ね返り・静止のY座標を求める。
+   * @param elapsed 画像生成からの経過時間（ms）。
+   */
   function fallingY(
     elapsed: number,
     start: number,
@@ -506,6 +595,7 @@ new p5((p) => {
     return landing;
   }
 
+  /** ゲームの論理画像列を、落下と左移動の補間を加えて描画する。 */
   function drawPieces(layout: Layout, now: number) {
     const metrics = visualMetrics(layout.stage);
     const ordered = [...game.pieces].sort(
@@ -558,6 +648,7 @@ new p5((p) => {
     }
   }
 
+  /** 現在時刻の前後にある判定点と入力目標線をリズムレールへ描く。 */
   function drawBeatRail(layout: Layout) {
     if (!analysis) return;
     const current = track.currentTime;
@@ -590,6 +681,7 @@ new p5((p) => {
     p.noStroke();
   }
 
+  /** 判定結果を、精度名または判定点からの時間差表示へ変換する。 */
   function judgementDetail(judgement: Judgement) {
     if (judgement.kind === "perfect") return "PERFECT";
     if (judgement.kind === "miss") return "MISS";
@@ -598,6 +690,7 @@ new p5((p) => {
     return `${milliseconds > 0 ? "+" : ""}${milliseconds} ms`;
   }
 
+  /** 直近のOK/NGとコンボ、プレイ開始直後の操作案内を描画する。 */
   function drawPlayingReadout(layout: Layout, now: number) {
     const sideX =
       layout.stage.x +
@@ -641,6 +734,7 @@ new p5((p) => {
     }
   }
 
+  /** プレイ中以外のフェーズに対応する中央メッセージと操作を描画する。 */
   function drawOverlay(layout: Layout) {
     const centerX = layout.stage.x + layout.stage.w / 2;
     const centerY = layout.stage.y + layout.stage.h * 0.42;
@@ -665,11 +759,7 @@ new p5((p) => {
       p.fill(255, 255, 255, 160);
       p.textStyle(p.NORMAL);
       p.textSize(layout.compact ? 11 : 13);
-      p.text(
-        "手拍子で、画面に記憶を残していく。",
-        centerX,
-        centerY + titleSize * 0.72,
-      );
+      p.text("ああ 取り繕っていたいな", centerX, centerY + titleSize * 0.72);
       drawButton(layout.overlayAction, "音声ファイルを選ぶ", true);
       return;
     }
@@ -773,6 +863,7 @@ new p5((p) => {
     }
   }
 
+  /** 背景、進捗、画像、判定レール、状態オーバーレイをステージ内へ描画する。 */
   function drawStage(layout: Layout, now: number) {
     const { stage } = layout;
     const context = p.drawingContext as CanvasRenderingContext2D;
@@ -828,6 +919,7 @@ new p5((p) => {
     p.noStroke();
   }
 
+  /** マイク状態をフッター用の短いラベルへ変換する。 */
   function microphoneLabel(state: MicrophoneState) {
     const labels: Record<MicrophoneState, string> = {
       off: "MIC STANDBY",
@@ -841,6 +933,7 @@ new p5((p) => {
     return labels[state];
   }
 
+  /** 再生可能状態とフェーズに合う再生・一時停止ボタンを描画する。 */
   function drawPlayControl(layout: Layout) {
     const { play } = layout;
     const enabled =
@@ -860,6 +953,7 @@ new p5((p) => {
     }
   }
 
+  /** 曲情報、進捗、得点、マイク設定、TAP操作を含むフッターを描画する。 */
   function drawFooter(layout: Layout, now: number) {
     const { footer, info, tap, mic } = layout;
     p.noStroke();
@@ -907,19 +1001,62 @@ new p5((p) => {
       p.textStyle(p.BOLD);
       p.textSize(9);
       p.text(microphoneLabel(microphone.state), mic.x, mic.y + 2);
-      const meterY = mic.y + 28;
-      const meterMaximum = Math.max(0.06, microphone.threshold * 1.5);
-      const level = clamp(microphone.level / meterMaximum, 0, 1);
-      const threshold = clamp(microphone.threshold / meterMaximum, 0, 1);
+      const noiseToggle = noiseSuppressionToggle(layout);
+      const noiseDisabled = microphone.state === "requesting";
+      const noiseHover = !noiseDisabled && pointIn(noiseToggle);
+      p.stroke(noiseDisabled ? COLORS.gray : COLORS.ink);
+      p.strokeWeight(1);
+      p.fill(
+        noiseDisabled
+          ? COLORS.paperDark
+          : microphone.noiseSuppression
+            ? noiseHover
+              ? COLORS.pink
+              : COLORS.cyan
+            : COLORS.paper,
+      );
+      p.rect(noiseToggle.x, noiseToggle.y, noiseToggle.w, noiseToggle.h, 2);
+      p.noStroke();
+      p.fill(noiseDisabled ? COLORS.gray : COLORS.ink);
+      p.textAlign(p.CENTER, p.CENTER);
+      p.textSize(8);
+      p.text(
+        `NS ${microphone.noiseSuppression ? "ON" : "OFF"}`,
+        noiseToggle.x + noiseToggle.w / 2,
+        noiseToggle.y + noiseToggle.h / 2,
+      );
+      const meter = microphoneMeter(layout);
+      const { minimum: meterMinimum, maximum: meterMaximum } =
+        MICROPHONE_THRESHOLD_RANGE;
+      const meterRange = meterMaximum - meterMinimum;
+      const level = clamp((microphone.level - meterMinimum) / meterRange, 0, 1);
+      const threshold = clamp(
+        (microphone.threshold - meterMinimum) / meterRange,
+        0,
+        1,
+      );
       p.fill(COLORS.paperDark);
-      p.rect(mic.x, meterY, mic.w, 8, 1);
+      p.rect(meter.x, meter.y, meter.w, meter.h, 1);
       p.fill(level >= threshold ? COLORS.pink : COLORS.cyan);
-      p.rect(mic.x, meterY, mic.w * level, 8, 1);
+      p.rect(meter.x, meter.y, meter.w * level, meter.h, 1);
       p.fill(COLORS.ink);
-      p.rect(mic.x + mic.w * threshold, meterY - 2, 2, 12);
+      p.rect(meter.x + meter.w * threshold, meter.y - 3, 2, 14);
       p.fill(COLORS.softInk);
+      p.textAlign(p.LEFT, p.TOP);
       p.textStyle(p.NORMAL);
-      p.text("input level", mic.x, meterY + 15);
+      p.textSize(8);
+      p.text(
+        `${microphone.thresholdMode === "automatic" ? "AUTO" : "MANUAL"} ${microphone.threshold.toFixed(3)}`,
+        mic.x,
+        meter.y + 13,
+      );
+      if (microphone.thresholdMode === "manual") {
+        const autoButton = automaticThresholdButton(layout);
+        p.fill(pointIn(autoButton) ? COLORS.pink : COLORS.softInk);
+        p.textAlign(p.RIGHT, p.TOP);
+        p.textStyle(p.BOLD);
+        p.text("AUTO↺", autoButton.x + autoButton.w, autoButton.y + 1);
+      }
     }
     const tapEnabled = game.phase === "playing";
     const tapPulse = now - lastInputAt < 130;
@@ -947,6 +1084,10 @@ new p5((p) => {
     );
   }
 
+  /**
+   * 描画フレームごとにマイクを検出し、曲時刻までゲーム判定を進める。
+   * ゲームオーバーが発生した場合は音声とマイクも停止する。
+   */
   function updateGame(layout: Layout, now: number) {
     const previousMicrophoneState = microphone.state;
     const microphoneTriggered =
@@ -972,8 +1113,18 @@ new p5((p) => {
     }
   }
 
+  /** 現在クリック可能な領域に応じてマウスカーソルを切り替える。 */
   function updateCursor(layout: Layout) {
+    const micInteractive =
+      layout.showMicPanel &&
+      (pointIn(microphoneMeter(layout)) ||
+        (microphone.state !== "requesting" &&
+          pointIn(noiseSuppressionToggle(layout))) ||
+        (microphone.thresholdMode === "manual" &&
+          pointIn(automaticThresholdButton(layout))));
     const interactive =
+      thresholdDragging ||
+      micInteractive ||
       pointIn(layout.upload) ||
       pointIn(layout.play) ||
       (game.phase === "playing" &&
@@ -984,8 +1135,31 @@ new p5((p) => {
     p.cursor(interactive ? p.HAND : p.ARROW);
   }
 
+  /** ポインター押下位置から、閾値・各ボタン・TAPの操作を振り分ける。 */
   function handlePointer() {
     const layout = createLayout();
+    if (layout.showMicPanel && pointIn(microphoneMeter(layout))) {
+      thresholdDragging = true;
+      setThresholdFromPointer(layout);
+      return false;
+    }
+    if (
+      layout.showMicPanel &&
+      microphone.state !== "requesting" &&
+      pointIn(noiseSuppressionToggle(layout))
+    ) {
+      void toggleNoiseSuppression();
+      return false;
+    }
+    if (
+      layout.showMicPanel &&
+      microphone.thresholdMode === "manual" &&
+      pointIn(automaticThresholdButton(layout))
+    ) {
+      microphone.useAutomaticThreshold();
+      announce("マイク入力感度を自動調整へ戻しました");
+      return false;
+    }
     if (pointIn(layout.upload)) {
       openFilePicker();
       return false;
@@ -1009,6 +1183,7 @@ new p5((p) => {
     return false;
   }
 
+  /** キャンバスと画像素材を初期化する、p5の起動時コールバック。 */
   p.setup = async () => {
     const canvas = p.createCanvas(window.innerWidth, window.innerHeight);
     canvas.parent(app);
@@ -1034,8 +1209,9 @@ new p5((p) => {
       announce(`${failedAssets}枚の画像素材を読み込めませんでした`);
   };
 
+  /** ゲーム更新後に全UIを再描画する、p5のフレームコールバック。 */
   p.draw = () => {
-    const now = performance.now();
+    const now = performance.now(); // ページ読み込みからの経過時間を取得
     const layout = createLayout();
     pieceVisibility = (piece) => isPieceVisible(layout, piece);
     updateGame(layout, now);
@@ -1047,6 +1223,20 @@ new p5((p) => {
   };
 
   p.mousePressed = handlePointer;
+  /** ドラッグ中のポインター位置をマイク閾値へ連続反映する。 */
+  p.mouseDragged = () => {
+    if (!thresholdDragging) return true;
+    setThresholdFromPointer(createLayout());
+    return false;
+  };
+  /** 閾値ドラッグを終了し、固定した値を読み上げる。 */
+  p.mouseReleased = () => {
+    if (!thresholdDragging) return true;
+    thresholdDragging = false;
+    announce(`マイク閾値を ${microphone.threshold.toFixed(3)} に固定しました`);
+    return false;
+  };
+  /** キーボード操作を入力、再生制御、曲選択、リトライへ振り分ける。 */
   p.keyPressed = (event?: KeyboardEvent) => {
     if (event?.repeat) return false;
     const code = event?.code ?? "";
@@ -1086,6 +1276,7 @@ new p5((p) => {
     }
     return true;
   };
+  /** ブラウザの表示領域にキャンバス寸法を追従させる。 */
   p.windowResized = () => p.resizeCanvas(window.innerWidth, window.innerHeight);
 }, app);
 

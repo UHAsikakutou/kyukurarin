@@ -1,5 +1,6 @@
 import type { AnalysisBeat } from "./audio";
 
+/** ゲーム全体の状態。UI表示と、各操作を受け付けるかの判定に使う。 */
 export type GamePhase =
   | "idle"
   | "analyzing"
@@ -10,33 +11,51 @@ export type GamePhase =
   | "gameover"
   | "error";
 
+/** 解析済み判定点に、プレイ中の処理状況を加えた内部状態。 */
 export type BeatState = AnalysisBeat & {
+  /** 許容時間内の入力と対応付けられたか。 */
   hit: boolean;
+  /** 判定点の時刻を迎え、盤面を左へ送ったか。 */
   shifted: boolean;
+  /** 遅判定の終了時刻を過ぎ、成功またはMISSが確定したか。 */
   resolved: boolean;
+  /** この判定点の成功に対応する画像を生成済みか。 */
   pieceCreated: boolean;
 };
 
+/** 盤面上を右から左へ移動する1枚の画像の論理状態。 */
 export type GamePiece = {
+  /** 描画要素を一意に識別する、プレイごとの連番。 */
   id: number;
+  /** `public/1.PNG`〜`7.PNG` のどれを使うかを表す0始まりの番号。 */
   imageIndex: number;
+  /** 現在の論理列。右端は4で、拍ごとに1ずつ減る。 */
   column: number;
+  /** 左移動アニメーション開始前の論理列。 */
   fromColumn: number;
+  /** 落下アニメーションを開始した `performance.now()` 時刻（ms）。 */
   spawnedAt: number;
+  /** 最後に左移動を開始した `performance.now()` 時刻（ms）。 */
   movedAt: number;
 };
 
+/** 1回の入力、または入力されなかった判定点の判定結果。 */
 export type Judgement = {
+  /** 成功精度、範囲外入力、未入力のいずれか。 */
   kind: "perfect" | "ok" | "ng" | "miss";
+  /** 入力時刻から判定点時刻を引いた秒数。入力先がなければ `null`。 */
   offset: number | null;
+  /** 判定表示アニメーションの基準となる `performance.now()` 時刻（ms）。 */
   at: number;
 };
 
+/** `advance()` が再生時刻を進めた結果、外側へ通知する出来事。 */
 export type GameEvent =
   | { type: "shift"; beatIndex: number }
   | { type: "miss"; beatIndex: number }
   | { type: "gameover" };
 
+/** レスポンシブ描画を考慮し、画像が実際に画面内かを判定する関数。 */
 export type PieceVisibility = (piece: GamePiece) => boolean;
 
 const RULES = {
@@ -52,6 +71,12 @@ const RULES = {
   imageWidths: [421, 456, 490, 418, 592, 540, 529] as const,
 };
 
+/**
+ * 音声再生や描画に依存せず、判定・得点・盤面・勝敗を管理する。
+ *
+ * 曲の時刻は秒、画像アニメーションの時刻は `performance.now()` 由来の
+ * ミリ秒で受け取る。`index.ts` が両方の時計を供給する。
+ */
 export class RhythmGame {
   phase: GamePhase = "idle";
   beats: BeatState[] = [];
@@ -70,27 +95,36 @@ export class RhythmGame {
   private nextPieceId = 1;
   private hasEverPlaced = false;
 
+  /** 盤面が持つ論理列の数。新しい画像は右端の列へ追加される。 */
   get slotCount() {
     return RULES.slotCount;
   }
 
+  /** 判定点より何秒前から入力を成功候補として受け付けるか。 */
   get earlyWindow() {
     return RULES.earlyWindow;
   }
 
+  /** 判定点より何秒後まで入力を成功候補として受け付けるか。 */
   get lateWindow() {
     return RULES.lateWindow;
   }
 
+  /** 固定の1920×1080基準で見積もった、画面内の画像数。 */
   get visiblePieceCount() {
     return this.countVisiblePieces();
   }
 
+  /** 確定済み判定点の割合。判定点がなければ0。 */
   get progress() {
     if (this.beats.length === 0) return 0;
     return this.nextResolveIndex / this.beats.length;
   }
 
+  /**
+   * 解析結果をプレイ用状態へ変換し、ゲームを開始待ちにする。
+   * @param beats 時刻順に並んだ、曲のゲーム用判定点。
+   */
   configure(beats: AnalysisBeat[]) {
     this.beats = beats.map((beat) => ({
       ...beat,
@@ -103,10 +137,12 @@ export class RhythmGame {
     this.resetRuntime();
   }
 
+  /** UIや音声処理で決まったフェーズをゲーム状態へ反映する。 */
   setPhase(phase: GamePhase) {
     this.phase = phase;
   }
 
+  /** 判定・得点・画像を初期化し、同じ譜面を曲頭から開始する。 */
   startFresh() {
     this.resetRuntime();
     for (const beat of this.beats) {
@@ -118,14 +154,24 @@ export class RhythmGame {
     this.phase = "playing";
   }
 
+  /** 一時停止中であればプレイ状態へ戻す。 */
   resume() {
     if (this.phase === "paused") this.phase = "playing";
   }
 
+  /** プレイ中であれば一時停止状態にする。 */
   pause() {
     if (this.phase === "playing") this.phase = "paused";
   }
 
+  /**
+   * 1回の手拍子または手動入力を、最も近い未確定判定点へ対応付ける。
+   * 成功時は得点とコンボを更新し、判定点の時刻を過ぎていれば画像も作る。
+   *
+   * @param songTime 入力が起きた曲中時刻（秒）。
+   * @param animationTime 判定表示と画像生成に使う単調増加時刻（ms）。
+   * @returns PERFECT、OK、または対応する判定点がないNG。
+   */
   registerInput(songTime: number, animationTime: number): Judgement {
     if (this.phase !== "playing") {
       return { kind: "ng", offset: null, at: animationTime };
@@ -190,12 +236,23 @@ export class RhythmGame {
     return judgement;
   }
 
+  /**
+   * 現在画面内にある画像を数える。
+   * @param isVisible 実際のレイアウトを使う任意の可視判定。省略時は基準画面で判定する。
+   */
   countVisiblePieces(isVisible?: PieceVisibility) {
     return this.pieces.filter((piece) =>
       isVisible ? isVisible(piece) : this.isPieceOnScreen(piece),
     ).length;
   }
 
+  /**
+   * 曲の再生時刻まで判定点を進め、盤面移動、MISS、途中敗北を確定する。
+   * @param songTime 現在の曲中時刻（秒）。
+   * @param animationTime 盤面移動と判定表示の開始時刻（ms）。
+   * @param isVisible 現在の画面サイズにおける画像の可視判定。
+   * @returns この更新で発生した出来事を時系列に並べた配列。
+   */
   advance(
     songTime: number,
     animationTime: number,
@@ -253,6 +310,12 @@ export class RhythmGame {
     return events;
   }
 
+  /**
+   * 曲終了時に残りの判定点を確定し、画像が残っていればクリアとする。
+   * @param animationTime 最終更新のアニメーション時刻（ms）。
+   * @param isVisible 現在の画面サイズにおける画像の可視判定。
+   * @returns 確定後のゲームフェーズ。
+   */
   finish(animationTime = 0, isVisible?: PieceVisibility) {
     if (this.phase !== "playing" && this.phase !== "paused") return this.phase;
     // endedイベントがdrawより先に届いた場合も、最後のhit/shiftを取りこぼさない。
@@ -264,6 +327,7 @@ export class RhythmGame {
     return this.phase;
   }
 
+  /** 全画像の論理列を1つ左へ進め、十分遠い画像を管理対象から外す。 */
   private shiftBoard(animationTime: number) {
     for (const piece of this.pieces) {
       piece.fromColumn = piece.column;
@@ -274,6 +338,7 @@ export class RhythmGame {
     this.pieces = this.pieces.filter((piece) => piece.column >= -5);
   }
 
+  /** 成功した判定点に対して画像を一度だけ右端へ追加する。 */
   private createPiece(beat: BeatState, animationTime: number) {
     if (beat.pieceCreated) return;
     beat.pieceCreated = true;
@@ -290,6 +355,7 @@ export class RhythmGame {
     this.hasEverPlaced = true;
   }
 
+  /** 1920×1080の基準コンポジション上で画像が画面と交差するか調べる。 */
   private isPieceOnScreen(piece: GamePiece) {
     const width = (RULES.imageWidths[piece.imageIndex] ?? 0) * RULES.imageScale;
     const center =
@@ -300,6 +366,7 @@ export class RhythmGame {
     );
   }
 
+  /** 譜面を保持したまま、1プレイ分の可変状態を初期値へ戻す。 */
   private resetRuntime() {
     this.pieces.length = 0;
     this.nextShiftIndex = 0;
