@@ -127,6 +127,12 @@ const app = requireElement<HTMLElement>("#app");
 const audioElement = requireElement<HTMLAudioElement>("#audio");
 const fileInput = requireElement<HTMLInputElement>("#audio-file");
 const liveRegion = requireElement<HTMLElement>("#live-region");
+const settings = requireElement<HTMLDetailsElement>("#audio-settings");
+const settingsButton = requireElement<HTMLElement>("#audio-settings > summary");
+const volumeInput = requireElement<HTMLInputElement>("#playback-volume");
+const volumeValue = requireElement<HTMLOutputElement>("#volume-value");
+const inputDeviceSelect = requireElement<HTMLSelectElement>("#input-device");
+const outputDeviceSelect = requireElement<HTMLSelectElement>("#output-device");
 const track = new TrackPlayer(audioElement);
 const microphone = new MicrophoneInput();
 const game = new RhythmGame();
@@ -138,6 +144,87 @@ let trackTitle = "音声ファイルを選択";
 let errorMessage = "";
 let lastInputAt = -Infinity;
 let pieceVisibility: PieceVisibility | undefined;
+
+/** 端末一覧を設定欄へ反映する。権限取得後はブラウザが実名を返す。 */
+async function refreshAudioDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    inputDeviceSelect.disabled = true;
+    outputDeviceSelect.disabled = true;
+    return;
+  }
+  const devices = await navigator.mediaDevices
+    .enumerateDevices()
+    .catch(() => []);
+  const fill = (
+    select: HTMLSelectElement,
+    kind: MediaDeviceKind,
+    defaultLabel: string,
+    selectedId: string,
+  ) => {
+    const matching = devices.filter((device) => device.kind === kind);
+    select.replaceChildren(new Option(defaultLabel, ""));
+    matching.forEach((device, index) => {
+      select.add(
+        new Option(
+          device.label ||
+            `${kind === "audioinput" ? "マイク" : "出力"} ${index + 1}`,
+          device.deviceId,
+        ),
+      );
+    });
+    select.value = selectedId;
+  };
+  fill(
+    inputDeviceSelect,
+    "audioinput",
+    "既定のマイク",
+    microphone.inputDeviceId,
+  );
+  fill(
+    outputDeviceSelect,
+    "audiooutput",
+    "既定の出力",
+    outputDeviceSelect.value,
+  );
+  outputDeviceSelect.disabled = !("setSinkId" in audioElement);
+}
+
+volumeInput.addEventListener("input", () => {
+  const volume = Number(volumeInput.value) / 100;
+  track.setVolume(volume);
+  volumeValue.value = `${volumeInput.value}%`;
+});
+
+settings.addEventListener("toggle", () => {
+  if (settings.open) void refreshAudioDevices();
+});
+
+// summaryはクリック後もフォーカスを保持し、次のSpaceを開閉操作に使ってしまう。
+// マウスで設定を開閉した後は、ゲームのキーボード操作へすぐ戻せるようにする。
+settingsButton.addEventListener("click", () => settingsButton.blur());
+
+inputDeviceSelect.addEventListener("change", async () => {
+  const changed = await microphone.setInputDevice(inputDeviceSelect.value);
+  announce(
+    changed
+      ? "入力デバイスを変更しました。マイクを再調整します"
+      : "入力デバイスを変更できませんでした",
+  );
+  await refreshAudioDevices();
+});
+
+outputDeviceSelect.addEventListener("change", async () => {
+  const changed = await track.setOutputDevice(outputDeviceSelect.value);
+  announce(
+    changed
+      ? "出力デバイスを変更しました"
+      : "出力デバイスを変更できませんでした",
+  );
+});
+
+navigator.mediaDevices?.addEventListener("devicechange", () => {
+  if (settings.open) void refreshAudioDevices();
+});
 
 /** スクリーンリーダー向けライブ領域へ状態変化を通知する。 */
 function announce(message: string) {
@@ -204,6 +291,7 @@ async function prepareMicrophone() {
   if (game.phase !== "ready" || microphone.state !== "off") return;
   announce("マイクの許可を待っています");
   const enabled = await microphone.start();
+  if (enabled) void refreshAudioDevices();
   if (game.phase !== "ready") {
     microphone.pause();
     return;
@@ -1136,7 +1224,11 @@ new p5((p) => {
   }
 
   /** ポインター押下位置から、閾値・各ボタン・TAPの操作を振り分ける。 */
-  function handlePointer() {
+  function handlePointer(event?: PointerEvent) {
+    // p5はwindow全体のpointerdownを監視するため、HTML設定欄の既定操作は
+    // キャンバス用ハンドラーでpreventDefaultされないよう、そのまま通す。
+    if (event?.target instanceof Node && settings.contains(event.target))
+      return true;
     const layout = createLayout();
     if (layout.showMicPanel && pointIn(microphoneMeter(layout))) {
       thresholdDragging = true;
@@ -1238,6 +1330,13 @@ new p5((p) => {
   };
   /** キーボード操作を入力、再生制御、曲選択、リトライへ振り分ける。 */
   p.keyPressed = (event?: KeyboardEvent) => {
+    // range/selectの操作中だけは設定側へキーを渡す。summaryにフォーカスが
+    // 残っていてもSpaceはゲーム操作を優先し、設定表示を再トグルさせない。
+    if (
+      event?.target instanceof HTMLInputElement ||
+      event?.target instanceof HTMLSelectElement
+    )
+      return true;
     if (event?.repeat) return false;
     const code = event?.code ?? "";
     if (code === "Space") {

@@ -740,6 +740,29 @@ export class TrackPlayer {
     return !this.element.paused && !this.element.ended;
   }
 
+  /** 0〜1の再生音量。譜面解析やマイク入力レベルには影響しない。 */
+  get volume() {
+    return this.element.volume;
+  }
+
+  setVolume(volume: number) {
+    this.element.volume = clamp(volume, 0, 1);
+  }
+
+  /** 対応ブラウザでは、曲を再生するスピーカーやヘッドホンを切り替える。 */
+  async setOutputDevice(deviceId: string) {
+    const element = this.element as HTMLAudioElement & {
+      setSinkId?: (sinkId: string) => Promise<void>;
+    };
+    if (!element.setSinkId) return false;
+    try {
+      await element.setSinkId(deviceId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   load(file: File) {
     // ローカルFileをこのページ内だけで参照できるURLへ変換する。
     // 音声をサーバーへ送る処理ではない。曲を替える前に旧URLを解放し、
@@ -818,6 +841,8 @@ export class MicrophoneInput {
   thresholdMode: MicrophoneThresholdMode = "automatic";
   /** getUserMedia / MediaStreamTrackへ希望するノイズ抑制の状態。 */
   noiseSuppression = false;
+  /** 空文字はOS既定、値がある場合は選択した入力デバイスを表す。 */
+  inputDeviceId = "";
 
   // context/analyser/streamはリアルタイム波形を読むためのWeb Audio経路。
   private context: AudioContext | null = null;
@@ -873,6 +898,23 @@ export class MicrophoneInput {
     } catch {
       return false;
     }
+  }
+
+  /** 次回または現在のマイク取得に使う入力デバイスを切り替える。 */
+  async setInputDevice(deviceId: string) {
+    if (deviceId === this.inputDeviceId) return true;
+    this.inputDeviceId = deviceId;
+    if (!this.stream) {
+      // 以前の取得失敗後でも、別デバイスを選べばMIC準備をやり直せるようにする。
+      if (this.state === "denied") this.state = "off";
+      return true;
+    }
+
+    const wasPaused = this.state === "paused";
+    await this.dispose();
+    const started = await this.start();
+    if (started && wasPaused) this.pause();
+    return started;
   }
 
   async start() {
@@ -1038,6 +1080,9 @@ export class MicrophoneInput {
       // ノイズ抑制はUIの選択を渡し、既定では無効を希望する。
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          ...(this.inputDeviceId
+            ? { deviceId: { exact: this.inputDeviceId } }
+            : {}),
           channelCount: { ideal: 1 },
           echoCancellation: { ideal: true },
           noiseSuppression: { ideal: this.noiseSuppression },
