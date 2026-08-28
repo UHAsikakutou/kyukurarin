@@ -736,12 +736,17 @@ new p5((p) => {
     }
   }
 
+  /** 譜面レールと解析ビューで共有する、現在時刻のX座標。 */
+  function rhythmTargetX(layout: Layout) {
+    return layout.stage.x + layout.stage.w * 0.77;
+  }
+
   /** 現在時刻の前後にある判定点と入力目標線をリズムレールへ描く。 */
   function drawBeatRail(layout: Layout) {
     if (!analysis) return;
     const current = track.currentTime;
     const railY = layout.stage.y + 24;
-    const targetX = layout.stage.x + layout.stage.w * 0.77;
+    const targetX = rhythmTargetX(layout);
     const pixelsPerSecond = Math.min(170, layout.stage.w * 0.14);
     p.stroke(255, 255, 255, 42);
     p.strokeWeight(1);
@@ -766,6 +771,174 @@ new p5((p) => {
     p.stroke(COLORS.cyan);
     p.strokeWeight(2);
     p.line(targetX, railY - 12, targetX, railY + 12);
+    p.noStroke();
+  }
+
+  /**
+   * 判定表示の背面に、解析で実際に使った3帯域のRMS振幅を流して描く。
+   * 桃線はBPM推定ライブラリの未加工の拍、シアン線は最終的なゲーム判定点で、
+   * 中央の白線が現在の再生時刻である。
+   */
+  function drawRhythmEvidence(layout: Layout) {
+    if (!analysis) return;
+    const context = p.drawingContext as CanvasRenderingContext2D;
+    const visualization = analysis.visualization;
+    const wide = layout.stage.w / layout.stage.h >= 1.2;
+    const targetX = rhythmTargetX(layout);
+    const panelWidth = layout.stage.w * (wide ? 0.38 : 0.42);
+    const panelMargin = layout.compact ? 10 : 18;
+    const panelHeight = Math.min(
+      clamp(layout.stage.h * 0.32, 128, layout.compact ? 156 : 190),
+      Math.max(64, layout.stage.h * 0.44),
+    );
+    const panel: Rect = {
+      // 右端の余白を固定し、画面幅が変わっても外枠との間隔を揃える。
+      x: layout.stage.x + layout.stage.w - panelWidth - panelMargin,
+      // OK/NGとコンボの下へ離し、判定結果を波形で隠さない。
+      y: layout.stage.y + layout.stage.h - panelHeight - 10,
+      w: panelWidth,
+      h: panelHeight,
+    };
+    const graphTop = panel.y + 58;
+    const graphBottom = panel.y + panel.h - 20;
+    const graphHeight = graphBottom - graphTop;
+    const centerX = targetX;
+    const secondsAcross = 2.4;
+    const pixelsPerSecond = panel.w / secondsAcross;
+    // パネルだけを右へ動かしても、現在時刻は譜面と同じtargetXに固定する。
+    const timeToX = (time: number) =>
+      targetX + (time - track.currentTime) * pixelsPerSecond;
+    const startTime =
+      track.currentTime - (targetX - panel.x) / pixelsPerSecond;
+    const endTime =
+      track.currentTime + (panel.x + panel.w - targetX) / pixelsPerSecond;
+
+    p.noStroke();
+    p.fill(9, 10, 13, 205);
+    p.rect(panel.x, panel.y, panel.w, panel.h, 2);
+    p.stroke(255, 255, 255, 30);
+    p.noFill();
+    p.rect(panel.x, panel.y, panel.w, panel.h, 2);
+
+    p.noStroke();
+    p.fill(255, 255, 255, 135);
+    p.textAlign(p.LEFT, p.CENTER);
+    p.textStyle(p.BOLD);
+    p.textSize(8);
+    p.text("FILTERED RMS  LOW / MID / HIGH", panel.x + 7, panel.y + 10);
+
+    const bands = [visualization.bass, visualization.mid, visualization.high];
+    const bandColors = [COLORS.cyan, COLORS.white, COLORS.pink];
+    const frameDuration = visualization.frameDuration;
+    const firstFrame = Math.max(0, Math.floor(startTime / frameDuration));
+    const lastFrame = Math.min(
+      bands[0]?.length ?? 0,
+      Math.ceil(endTime / frameDuration),
+    );
+    const step = Math.max(1, Math.ceil((lastFrame - firstFrame) / panel.w));
+
+    bands.forEach((band, bandIndex) => {
+      const rowHeight = graphHeight / bands.length;
+      const baseline = graphTop + rowHeight * (bandIndex + 0.72);
+      p.stroke(255, 255, 255, 18);
+      p.strokeWeight(1);
+      p.line(panel.x, baseline, panel.x + panel.w, baseline);
+      p.noFill();
+      p.stroke(bandColors[bandIndex] ?? COLORS.white);
+      p.strokeWeight(1.15);
+      p.beginShape();
+      for (let frame = firstFrame; frame < lastFrame; frame += step) {
+        const time = (frame + 0.5) * frameDuration;
+        const amplitude = clamp(
+          (band[frame] ?? 0) /
+            (visualization.bandCeilings[bandIndex] ?? 0.0001),
+          0,
+          1,
+        );
+        p.vertex(timeToX(time), baseline - amplitude * rowHeight * 0.58);
+      }
+      p.endShape();
+    });
+
+    // ライブラリ拍は推定結果そのものなので、特定帯域へ割り当てず薄白にする。
+    for (const beat of visualization.libraryBeats) {
+      if (beat < startTime) continue;
+      if (beat > endTime) break;
+      const x = timeToX(beat);
+      p.stroke(255, 255, 255, 105);
+      p.strokeWeight(1);
+      context.setLineDash([3, 3]);
+      p.line(x, graphTop, x, graphBottom);
+    }
+    context.setLineDash([]);
+    for (const beat of game.beats) {
+      if (beat.time < startTime) continue;
+      if (beat.time > endTime) break;
+      const values = beat.contributions
+        ? [
+            beat.contributions.bass,
+            beat.contributions.mid,
+            beat.contributions.high,
+          ]
+        : [0, 0, 0];
+      const total = values.reduce((sum, value) => sum + value, 0);
+      const dominantIndex =
+        beat.source === "library" || total <= 0
+          ? -1
+          : values.reduce(
+              (best, value, index) =>
+                value > (values[best] ?? -Infinity) ? index : best,
+              0,
+            );
+      if (dominantIndex >= 0)
+        p.stroke(bandColors[dominantIndex] ?? COLORS.white);
+      else p.stroke(255, 255, 255, 135);
+      p.strokeWeight(beat.strength > 0.55 ? 2.2 : 1.2);
+      const x = timeToX(beat.time);
+      p.line(x, graphTop, x, graphBottom);
+
+      // onsetに結び付いた判定点だけ、3帯域の寄与率を縦棒の真上へ表示する。
+      if (dominantIndex >= 0) {
+        const percentages = values.map((value) =>
+          Math.round((value / total) * 100),
+        );
+        // 個別丸めで99%や101%になった差は、最大寄与帯域へ戻して合計100%にする。
+        percentages[dominantIndex] =
+          (percentages[dominantIndex] ?? 0) +
+          100 -
+          percentages.reduce((sum, value) => sum + value, 0);
+        const labels = ["L", "M", "H"];
+        p.noStroke();
+        p.textAlign(p.CENTER, p.CENTER);
+        p.textStyle(p.BOLD);
+        p.textSize(layout.compact ? 6 : 7);
+        for (let index = 0; index < labels.length; index += 1) {
+          if (index === dominantIndex) p.fill(bandColors[index] ?? COLORS.white);
+          else p.fill(255, 255, 255, 135);
+          p.text(
+            `${labels[index]}${percentages[index] ?? 0}`,
+            x,
+            panel.y + 24 + index * 10,
+          );
+        }
+      }
+    }
+    p.stroke(COLORS.white);
+    p.strokeWeight(1.5);
+    p.line(centerX, graphTop - 2, centerX, graphBottom + 2);
+
+    p.noStroke();
+    p.fill(255, 255, 255, 125);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textStyle(p.BOLD);
+    p.textSize(7);
+    p.text("LIBRARY BEAT", panel.x + panel.w * 0.27, panel.y + panel.h - 9);
+    p.fill(255, 255, 255, 135);
+    p.circle(panel.x + panel.w * 0.12, panel.y + panel.h - 9, 4);
+    p.fill(255, 255, 255, 125);
+    p.text("RHYTHM POINT", panel.x + panel.w * 0.73, panel.y + panel.h - 9);
+    p.fill(COLORS.cyan);
+    p.circle(panel.x + panel.w * 0.57, panel.y + panel.h - 9, 4);
     p.noStroke();
   }
 
@@ -996,6 +1169,11 @@ new p5((p) => {
     }
     if (game.phase === "playing") {
       drawBeatRail(layout);
+    }
+    if (game.phase === "playing" || game.phase === "paused") {
+      drawRhythmEvidence(layout);
+    }
+    if (game.phase === "playing") {
       drawPlayingReadout(layout, now);
     }
     if (game.phase !== "playing") drawOverlay(layout);

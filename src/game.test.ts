@@ -5,6 +5,8 @@ const makeBeats = (count: number) =>
   Array.from({ length: count }, (_, index) => ({
     time: index + 1,
     strength: 1,
+    contributions: { bass: 1, mid: 0, high: 0 },
+    source: "onset" as const,
   }));
 
 describe("RhythmGame", () => {

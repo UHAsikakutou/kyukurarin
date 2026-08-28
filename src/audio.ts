@@ -27,6 +27,17 @@ export type AnalysisBeat = {
    * 線幅だけに使い、判定幅・得点・画像生成へ直接は使わない。
    */
   strength: number;
+  /** onsetのnoveltyへ各帯域が寄与した比率。3値の合計は通常1になる。 */
+  contributions: BandContributions;
+  /** 判定点がonset、ライブラリの拍、最終フォールバックのどれに由来するか。 */
+  source: "onset" | "library" | "fallback";
+};
+
+/** noveltyへ加算する重みまで反映した、低・中・高域の相対寄与率。 */
+export type BandContributions = {
+  bass: number;
+  mid: number;
+  high: number;
 };
 
 /** `analyzeTrack` がUIとゲーム初期化へ渡す、曲全体の解析結果。 */
@@ -42,6 +53,24 @@ export type TrackAnalysis = {
   tempo: number;
   /** READY画面に、一定グリッドかonset系フォールバックかを表示する。 */
   strategy: "tempo-grid" | "onset";
+  /** ゲーム中に、判定点が作られた根拠を曲時刻と同期して描くための解析値。 */
+  visualization: TrackVisualization;
+};
+
+/** 解析時の帯域別RMSと、BPM推定ライブラリが返した拍位置。 */
+export type TrackVisualization = {
+  /** 各RMS要素が表す時間幅（秒）。 */
+  frameDuration: number;
+  /** 220 Hz以下のローパス出力を512サンプルごとにRMS化した振幅。 */
+  bass: Float32Array;
+  /** 220〜2,400 Hz付近のバンド成分をRMS化した振幅。 */
+  mid: Float32Array;
+  /** 2,400 Hz以上のハイパス成分をRMS化した振幅。 */
+  high: Float32Array;
+  /** 描画時の振幅正規化に使う、帯域ごとの外れ値に強い上限。 */
+  bandCeilings: [number, number, number];
+  /** 外部ライブラリのBPMとoffsetを、そのまま等間隔の時刻列へ展開した拍。 */
+  libraryBeats: number[];
 };
 
 /**
@@ -109,6 +138,59 @@ function median(values: number[]) {
   const middle = Math.floor(values.length / 2);
   if (values.length % 2 === 1) return values[middle] ?? 0;
   return ((values[middle - 1] ?? 0) + (values[middle] ?? 0)) / 2;
+}
+
+/** 大音量の一瞬だけに表示倍率を支配されないよう、指定百分位を返す。 */
+function percentile(values: Float32Array, ratio: number) {
+  if (values.length === 0) return 0;
+  const sorted = Array.from(values).sort((left, right) => left - right);
+  return sorted[Math.floor((sorted.length - 1) * clamp(ratio, 0, 1))] ?? 0;
+}
+
+/** noveltyと同じ帯域重みを使い、3帯域の増加量を合計1の寄与率へ変換する。 */
+export function calculateBandContributions(
+  bassRise: number,
+  midRise: number,
+  highRise: number,
+): BandContributions {
+  const bass = Math.max(0, bassRise) * 1.35;
+  const mid = Math.max(0, midRise);
+  const high = Math.max(0, highRise) * 0.82;
+  const total = bass + mid + high;
+  if (total <= 0) return { bass: 0, mid: 0, high: 0 };
+  return { bass: bass / total, mid: mid / total, high: high / total };
+}
+
+/** ライブラリが推定したBPM/offsetを、加工前の拍目盛りへ展開する。 */
+export function expandTempoSegmentsToBeats(
+  segments: TempoSegment[],
+  duration: number,
+) {
+  const markers: number[] = [];
+  for (const segment of segments) {
+    const start = Math.max(0, segment.start);
+    const end = Math.min(duration, segment.end);
+    const interval = 60 / segment.bpm;
+    if (
+      end <= start ||
+      !Number.isFinite(interval) ||
+      interval <= 0 ||
+      !Number.isFinite(segment.offset)
+    ) {
+      continue;
+    }
+    let time =
+      segment.offset + Math.ceil((start - segment.offset) / interval) * interval;
+    while (time < end) {
+      if (time >= 0 && time <= duration) markers.push(time);
+      time += interval;
+    }
+  }
+  markers.sort((left, right) => left - right);
+  // 隣接区間が境界上の同じ拍を返した場合だけ、表示線を1本へまとめる。
+  return markers.filter(
+    (time, index) => index === 0 || time - (markers[index - 1] ?? -Infinity) > 0.01,
+  );
 }
 
 function throwIfAborted(signal?: AbortSignal) {
@@ -252,6 +334,8 @@ export function alignBeatsToTempoGrid(
       // 立ち上がりへ合わせる。これで演奏の微細な前ノリ・後ノリを消さない。
       time: onset?.time ?? time,
       strength: onset ? clamp(0.35 + onset.strength * 0.65, 0.35, 1) : 0.28,
+      contributions: onset?.contributions ?? { bass: 0, mid: 0, high: 0 },
+      source: onset?.source ?? "library",
     });
     gridIndex += 1;
   }
@@ -504,6 +588,15 @@ export async function analyzeTrack(
   // log1pによる対数圧縮で、大音量部分だけが評価を独占するのを抑える。
   // 36は検出しやすい数値範囲に合わせる経験的倍率で、物理単位は持たない。
   const logEnergy = (value: number) => Math.log1p(value * 36);
+  const contributionsAt = (index: number) =>
+    calculateBandContributions(
+      logEnergy(bassEnergy[index] ?? 0) -
+        logEnergy(bassEnergy[index - 1] ?? 0),
+      logEnergy(midEnergy[index] ?? 0) -
+        logEnergy(midEnergy[index - 1] ?? 0),
+      logEnergy(highEnergy[index] ?? 0) -
+        logEnergy(highEnergy[index - 1] ?? 0),
+    );
   for (let index = 1; index < frameCount; index += 1) {
     const bassRise = Math.max(
       0,
@@ -587,6 +680,8 @@ export async function analyzeTrack(
             0.08,
             1,
           ),
+          contributions: contributionsAt(index),
+          source: "onset",
         });
       }
     }
@@ -677,6 +772,8 @@ export async function analyzeTrack(
         // 最終退避でも表示上の強弱は残す。ただし強い判定点に見えすぎないよう
         // 上限を0.72とし、完全な無音でも細い線として見える下限を置く。
         strength: clamp((novelty[bestIndex] ?? 0) / 0.18, 0.1, 0.72),
+        contributions: contributionsAt(bestIndex),
+        source: "fallback",
       });
     }
     strategy = "onset";
@@ -698,6 +795,14 @@ export async function analyzeTrack(
   }
 
   onProgress?.(1);
+  const libraryBeats = expandTempoSegmentsToBeats(
+    tempoSegments.length > 0
+      ? tempoSegments
+      : tempoGuess
+        ? [{ ...tempoGuess, start: 0, end: buffer.duration }]
+        : [],
+    buffer.duration,
+  );
   return {
     beats,
     duration: buffer.duration,
@@ -705,6 +810,19 @@ export async function analyzeTrack(
     // ライブラリが推定した元のBPMを表示する。
     tempo: Math.round(tempo),
     strategy,
+    visualization: {
+      frameDuration,
+      bass: bassEnergy,
+      mid: midEnergy,
+      high: highEnergy,
+      // 98百分位を表示上端にする。上限を超える瞬間は描画側でクリップする。
+      bandCeilings: [
+        Math.max(0.0001, percentile(bassEnergy, 0.98)),
+        Math.max(0.0001, percentile(midEnergy, 0.98)),
+        Math.max(0.0001, percentile(highEnergy, 0.98)),
+      ],
+      libraryBeats,
+    },
   };
 }
 

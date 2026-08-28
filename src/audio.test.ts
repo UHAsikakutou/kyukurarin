@@ -4,14 +4,45 @@ import {
   MicrophoneInput,
   alignBeatsToTempoGrid,
   alignBeatsToTempoMap,
+  calculateBandContributions,
+  expandTempoSegmentsToBeats,
+  type AnalysisBeat,
 } from "./audio";
+
+const onset = (time: number, strength: number): AnalysisBeat => ({
+  time,
+  strength,
+  contributions: { bass: 1, mid: 0, high: 0 },
+  source: "onset",
+});
+
+describe("calculateBandContributions", () => {
+  test("onset検出と同じ重みで3帯域の寄与率を正規化する", () => {
+    const result = calculateBandContributions(1, 1, 1);
+
+    expect(result.bass + result.mid + result.high).toBeCloseTo(1);
+    expect(result.bass).toBeGreaterThan(result.mid);
+    expect(result.mid).toBeGreaterThan(result.high);
+  });
+});
+
+describe("expandTempoSegmentsToBeats", () => {
+  test("ライブラリのBPMとoffsetを加工前の拍位置へ展開する", () => {
+    expect(
+      expandTempoSegmentsToBeats(
+        [{ start: 0, end: 2, bpm: 120, offset: 0.25 }],
+        2,
+      ),
+    ).toEqual([0.25, 0.75, 1.25, 1.75]);
+  });
+});
 
 describe("alignBeatsToTempoGrid", () => {
   test("BPMとoffsetの骨格を近傍onsetへ合わせる", () => {
     const beats = alignBeatsToTempoGrid(
       [
-        { time: 0.49, strength: 0.8 },
-        { time: 1.01, strength: 0.7 },
+        onset(0.49, 0.8),
+        onset(1.01, 0.7),
       ],
       3,
       { bpm: 120, offset: 0 },
@@ -24,9 +55,9 @@ describe("alignBeatsToTempoGrid", () => {
   test("判定時刻を近いonsetへ合わせ、強い裏拍を譜面へ加える", () => {
     const beats = alignBeatsToTempoGrid(
       [
-        { time: 0.54, strength: 0.8 },
-        { time: 0.81, strength: 0.9 },
-        { time: 1.48, strength: 0.7 },
+        onset(0.54, 0.8),
+        onset(0.81, 0.9),
+        onset(1.48, 0.7),
       ],
       2.2,
       { bpm: 120, offset: 0 },
@@ -38,9 +69,9 @@ describe("alignBeatsToTempoGrid", () => {
   test("高BPMでは強い表拍側を選んで過密な譜面を避ける", () => {
     const beats = alignBeatsToTempoGrid(
       [
-        { time: 0.433, strength: 1 },
-        { time: 1.1, strength: 1 },
-        { time: 1.767, strength: 1 },
+        onset(0.433, 1),
+        onset(1.1, 1),
+        onset(1.767, 1),
       ],
       2.2,
       { bpm: 180, offset: 0.1 },
@@ -52,7 +83,7 @@ describe("alignBeatsToTempoGrid", () => {
 
   test("無音区間はonsetがなければ判定点を置かない", () => {
     const beats = alignBeatsToTempoGrid(
-      [{ time: 1, strength: 0.9 }],
+      [onset(1, 0.9)],
       2.5,
       { bpm: 120, offset: 0 },
       (time) => time >= 0.9 && time <= 1.1,
@@ -66,11 +97,11 @@ describe("alignBeatsToTempoMap", () => {
   test("区間ごとのBPMを対応する範囲だけへ適用する", () => {
     const beats = alignBeatsToTempoMap(
       [
-        { time: 0.5, strength: 0.9 },
-        { time: 1, strength: 0.9 },
-        { time: 1.5, strength: 0.9 },
-        { time: 2.7, strength: 0.9 },
-        { time: 3.3, strength: 0.9 },
+        onset(0.5, 0.9),
+        onset(1, 0.9),
+        onset(1.5, 0.9),
+        onset(2.7, 0.9),
+        onset(3.3, 0.9),
       ],
       4,
       [
